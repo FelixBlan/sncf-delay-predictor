@@ -1,6 +1,6 @@
 # 🚆 SNCF Delay Predictor
 
-[![CI](https://github.com/<your-username>/sncf-delay-predictor/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-username>/sncf-delay-predictor/actions/workflows/ci.yml)
+[![CI](https://github.com/ffblan74/sncf-delay-predictor/actions/workflows/ci.yml/badge.svg)](https://github.com/ffblan74/sncf-delay-predictor/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -200,7 +200,7 @@ station and across the network.
 The trained model ships in `models/`, so the API runs straight from a clone.
 
 ```bash
-git clone https://github.com/<your-username>/sncf-delay-predictor.git
+git clone https://github.com/ffblan74/sncf-delay-predictor.git
 cd sncf-delay-predictor
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt

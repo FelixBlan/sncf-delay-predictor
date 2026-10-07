@@ -6,16 +6,14 @@ served by the API is bit-for-bit the prediction the training pipeline would
 have produced for the same row (no train/serve skew).
 """
 
-import sys
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 import data_pipeline as dp
-from generate_data import ROUTES, write
+from context import CONTEXT_COLUMNS
+from generate_data import ROUTES, generate_context, write
 
 DEP, ARR, _ = ROUTES[0]
 
@@ -28,8 +26,9 @@ def client(tmp_path_factory, monkeypatch_module):
     model_dir = tmp_path_factory.mktemp("models")
     csv = data_dir / "raw.csv"
     write(str(csv), n_months=84, seed=11)
+    generate_context(n_months=84, seed=11).save(data_dir)
     train_module.train(str(csv), str(model_dir), model_kind="hgb",
-                       test_months=6, cv_folds=1)
+                       test_months=6, cv_folds=1, context_dir=data_dir)
 
     monkeypatch_module.setenv("SNCF_MODEL_DIR", str(model_dir))
     import api
@@ -61,6 +60,14 @@ def test_metrics_exposes_the_evaluation_report(client):
     assert body["target"] == dp.TARGET
     assert body["test"]["n_rows"] > 0
     assert "mean_12_months" in body["baselines"]
+    # the context's contribution is measured, not assumed
+    assert {"test_observed_weather", "test_without_context"} <= set(body)
+
+
+def test_served_model_is_refitted_on_every_month(client):
+    body = client.get("/metrics").json()
+    assert body["final_fit"]["to"] == body["test"]["to"]
+    assert body["final_fit"]["n_rows"] > body["train"]["n_rows"]
 
 
 def test_routes_lists_every_od_pair(client):
@@ -78,8 +85,17 @@ def test_predict_defaults_to_the_month_after_the_data(client):
     assert body["predicted_delay_minutes"] >= 0
     assert body["is_backtest"] is False
     assert body["actual_delay_minutes"] is None
+    assert body["model"] == "final"
+    assert body["weather"] == "forecast"
     # a monthly average that far off would mean the anchor is not being used
     assert abs(body["predicted_delay_minutes"] - body["recent_average_minutes"]) < 10
+
+
+def test_predict_reports_the_context_it_used(client):
+    body = client.post("/predict", json={"gare_depart": DEP, "gare_arrivee": ARR}).json()
+    assert set(body["context"]) == set(CONTEXT_COLUMNS)
+    assert body["context"]["wx_frost_days"] is not None   # normals for a future month
+    assert body["context"]["cal_weekend_days"] >= 8
 
 
 def test_predict_on_a_known_month_is_a_backtest(client):
@@ -91,6 +107,40 @@ def test_predict_on_a_known_month_is_a_backtest(client):
     assert body["month"] == last
     assert body["is_backtest"] is True
     assert body["actual_delay_minutes"] is not None
+    assert body["model"] == "evaluation"
+    assert body["weather"] == "normal"
+
+
+def test_harsh_weather_changes_the_forecast(client):
+    payload = {"gare_depart": DEP, "gare_arrivee": ARR}
+    normal = client.post("/predict", json={**payload, "weather": "normal"}).json()
+    harsh = client.post("/predict", json={**payload, "weather": "harsh"}).json()
+    assert harsh["context"]["wx_frost_days"] >= normal["context"]["wx_frost_days"]
+    assert harsh["predicted_delay_minutes"] != normal["predicted_delay_minutes"]
+
+
+def test_observed_weather_is_refused_for_the_future(client):
+    response = client.post(
+        "/predict", json={"gare_depart": DEP, "gare_arrivee": ARR, "weather": "observed"}
+    )
+    assert response.status_code == 422
+    assert "observed weather" in response.json()["detail"]
+
+
+def test_observed_weather_is_available_for_a_past_month(client):
+    last = client.get("/health").json()["history_up_to"]
+    body = client.post(
+        "/predict",
+        json={"gare_depart": DEP, "gare_arrivee": ARR, "month": last, "weather": "observed"},
+    ).json()
+    assert body["weather"] == "observed"
+
+
+def test_predict_rejects_an_unknown_weather_scenario(client):
+    response = client.post(
+        "/predict", json={"gare_depart": DEP, "gare_arrivee": ARR, "weather": "sunny"}
+    )
+    assert response.status_code == 422
 
 
 def test_predict_accepts_a_timetable_override(client):
@@ -142,11 +192,52 @@ def test_served_prediction_matches_the_training_pipeline(client):
         json={"gare_depart": DEP, "gare_arrivee": ARR, "month": str(month)},
     ).json()["predicted_delay_minutes"]
 
-    engineered = dp.engineer_features(dp.to_panel(art.history))
+    engineered = dp.build_features(dp.to_panel(art.history), art.context, "normal")
     row = engineered[
         (engineered["gare_depart"] == DEP)
         & (engineered["gare_arrivee"] == ARR)
         & (engineered[dp.PERIOD] == month)
     ]
-    offline = dp.predict_delays(art.model, row)[0]
+    offline = dp.predict_delays(art.eval_model, row)[0]
     assert served == pytest.approx(round(float(offline), 1))
+
+
+def test_history_pairs_observations_with_one_step_forecasts(client):
+    body = client.get("/history", params={"gare_depart": DEP, "gare_arrivee": ARR}).json()
+    assert body["gare_depart"] == DEP
+    assert body["test_from"] is not None
+    months = [p["month"] for p in body["points"]]
+    assert months == sorted(months)
+    # the very first month has no history behind it, hence no forecast
+    assert body["points"][0]["predicted_delay_minutes"] is None
+    assert all(p["predicted_delay_minutes"] is not None for p in body["points"][-12:])
+
+
+def test_history_forecasts_are_the_backtests_predict_serves(client):
+    """The chart must show exactly what /predict answers for a past month."""
+    points = client.get(
+        "/history", params={"gare_depart": DEP, "gare_arrivee": ARR}
+    ).json()["points"]
+    for point in points[-3:]:
+        served = client.post(
+            "/predict",
+            json={"gare_depart": DEP, "gare_arrivee": ARR, "month": point["month"]},
+        ).json()
+        assert served["predicted_delay_minutes"] == pytest.approx(
+            point["predicted_delay_minutes"], abs=0.051
+        )
+        assert served["actual_delay_minutes"] == pytest.approx(
+            point["actual_delay_minutes"], abs=0.051
+        )
+
+
+def test_history_rejects_an_unknown_route(client):
+    response = client.get("/history", params={"gare_depart": "LILLE", "gare_arrivee": "TOKYO"})
+    assert response.status_code == 404
+
+
+def test_web_ui_is_served_at_the_root(client):
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "/predict" in response.text

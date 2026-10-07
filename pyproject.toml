@@ -1,0 +1,23 @@
+[project]
+name = "sncf-delay-predictor"
+version = "1.0.0"
+description = "Monthly TGV delay forecaster trained on SNCF's public regularity data"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Felix Blanchier" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = [
+    # starlette nudging towards httpx2; TestClient works fine with httpx
+    "ignore:Using `httpx` with `starlette.testclient`",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]

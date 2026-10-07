@@ -12,7 +12,9 @@ exercised end to end without any download:
   network-wide drift -- i.e. the structure the lag features exploit;
 * the same data-quality traps: months with zero traffic, a handful of
   corrupt negative averages, and a free-text comment column containing
-  embedded newlines and semicolons.
+  embedded newlines and semicolons;
+* a matching context (`generate_context`): monthly weather per station,
+  which the synthetic delays depend on, and a school-holiday calendar.
 
 It is *not* a substitute for the real data when reporting metrics: the
 numbers in the README come from the real export.
@@ -20,8 +22,14 @@ numbers in the README come from the real export.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+from context import PERIOD, STATION, WEATHER_COLS, Context
+
+DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "raw_regularity.csv"
 
 COLUMNS = [
     "date", "service", "gare_depart", "gare_arrivee", "duree_moyenne",
@@ -55,10 +63,52 @@ _INCIDENT_COMMENT = (
 )
 
 
+def _synthetic_weather(months: pd.PeriodIndex, seed: int) -> pd.DataFrame:
+    """Seasonal monthly weather for every station of `ROUTES`."""
+    rng = np.random.default_rng(seed + 1000)
+    stations = sorted({s for dep, arr, _ in ROUTES for s in (dep, arr)})
+    rows = []
+    for station in stations:
+        for month in months:
+            winter, summer = month.month in (12, 1, 2), month.month in (6, 7, 8)
+            frost = rng.poisson(8 if winter else 2 if month.month in (3, 11) else 0)
+            rain = rng.gamma(4.0, 15.0)
+            rows.append({
+                STATION: station, PERIOD: month,
+                "frost_days": frost,
+                "hot_days": rng.poisson(5 if summer else 0),
+                "rain_mm": round(rain, 1),
+                "heavy_rain_days": rng.poisson(rain / 80),
+                "snow_days": rng.poisson(frost / 4),
+                "windy_days": rng.poisson(3 if winter else 1),
+            })
+    return pd.DataFrame(rows)[[STATION, PERIOD, *WEATHER_COLS]]
+
+
+def _synthetic_school(months: pd.PeriodIndex) -> pd.DataFrame:
+    """Summer for all zones, and winter holidays staggered by zone."""
+    rows = []
+    for year in sorted({m.year for m in months}):
+        for z, zone in enumerate("ABC"):
+            rows.append({"zone": zone, "start": pd.Timestamp(year, 7, 5),
+                         "end": pd.Timestamp(year, 9, 1)})
+            winter = pd.Timestamp(year, 2, 7) + pd.Timedelta(weeks=z)
+            rows.append({"zone": zone, "start": winter,
+                         "end": winter + pd.Timedelta(weeks=2)})
+    return pd.DataFrame(rows)
+
+
+def generate_context(n_months: int = 96, seed: int = 42, start: str = "2018-01") -> Context:
+    """The weather and school calendar that go with `generate(...)`."""
+    months = pd.period_range(start, periods=n_months, freq="M")
+    return Context(_synthetic_weather(months, seed), _synthetic_school(months))
+
+
 def generate(n_months: int = 96, seed: int = 42, start: str = "2018-01") -> pd.DataFrame:
     """Build a synthetic monthly panel over `n_months` for every route."""
     rng = np.random.default_rng(seed)
     months = pd.period_range(start, periods=n_months, freq="M")
+    weather = _synthetic_weather(months, seed).set_index([STATION, PERIOD])
 
     # per-route persistent delay level, and a slow network-wide drift
     levels = {route: rng.uniform(3.0, 9.0) for route in ROUTES}
@@ -73,10 +123,13 @@ def generate(n_months: int = 96, seed: int = 42, start: str = "2018-01") -> pd.D
         for i, month in enumerate(months):
             # seasonality: worse in summer holidays and in December
             seasonal = 1.6 if month.month in (7, 8, 12) else 0.0
+            # frost and heat at either end of the line cost minutes
+            ends = weather.loc[[(dep, month), (arr, month)]].mean()
+            weather_effect = 0.15 * ends["frost_days"] + 0.25 * ends["hot_days"]
             # autocorrelated: this month resembles the last one
             delay = max(
                 0.2,
-                0.55 * previous + 0.45 * level + seasonal + drift[i]
+                0.55 * previous + 0.45 * level + seasonal + weather_effect + drift[i]
                 + rng.normal(0, 1.2),
             )
             previous = delay
@@ -124,8 +177,9 @@ def _inject_quality_issues(df: pd.DataFrame, rng: np.random.Generator) -> pd.Dat
     return df
 
 
-def write(path: str = "data/raw_regularity.csv", **kwargs) -> pd.DataFrame:
+def write(path: str | Path = DEFAULT_OUT, **kwargs) -> pd.DataFrame:
     df = generate(**kwargs)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, sep=";", index=False)
     return df
 
@@ -134,12 +188,17 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", default="data/raw_regularity.csv")
+    parser.add_argument("--out", default=str(DEFAULT_OUT))
     parser.add_argument("--months", type=int, default=96)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--context-dir", default=None,
+                        help="also write the matching weather / school calendar there")
     args = parser.parse_args()
 
     df = write(args.out, n_months=args.months, seed=args.seed)
     print(f"Wrote {len(df)} rows ({df['date'].nunique()} months, "
           f"{len(ROUTES)} routes) to {args.out}")
     print(df.head(3).to_string())
+    if args.context_dir:
+        generate_context(n_months=args.months, seed=args.seed).save(args.context_dir)
+        print(f"Wrote the synthetic context to {args.context_dir}")

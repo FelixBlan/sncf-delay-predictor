@@ -5,11 +5,17 @@ A caller cannot reasonably supply 35 lagged features, so the service ships
 with the cleaned history panel written by `train.py` and builds the feature
 row itself, through the exact same pipeline functions used for training --
 that is what rules out train/serve skew. The client only provides what it
-actually knows: an OD pair, a month, and optionally next month's timetable.
+actually knows: an OD pair, a month, optionally next month's timetable and
+a weather scenario (see `context.py`).
+
+The coming month is forecast by the model refitted on every month
+(`model.joblib`); past months are answered by the evaluation model
+(`model_eval.joblib`, fitted before the test period) under the `normal`
+weather scenario, so that the history chart shows genuine forecasts.
 
 Run locally:
-    cd src && uvicorn api:app --reload
-Then open http://127.0.0.1:8000/docs
+    uvicorn api:app --app-dir src --reload
+Then open http://127.0.0.1:8000 (web UI) or http://127.0.0.1:8000/docs
 """
 
 from __future__ import annotations
@@ -18,28 +24,36 @@ import json
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 import joblib
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from context import CONTEXT_COLUMNS, Context
 from data_pipeline import (
+    ANCHOR,
     KNOWN_IN_ADVANCE,
     OD,
     OD_KEY,
     PERIOD,
     TARGET,
-    engineer_features,
+    build_features,
     load_raw,
     predict_delays,
     to_panel,
 )
 
+# What past months are scored with: no hindsight on the weather.
+BACKTEST_WEATHER = "normal"
+
 # Overridable so a deployment (or a test) can point at another artifact set.
 MODEL_DIR = Path(
     os.environ.get("SNCF_MODEL_DIR", Path(__file__).resolve().parent.parent / "models")
 )
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(
     title="SNCF Delay Predictor",
@@ -48,15 +62,18 @@ app = FastAPI(
         "of a TGV origin-destination pair for a given month, from SNCF's "
         "public monthly regularity data."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
 class Artifacts:
-    """Model, feature contract and history panel, loaded once."""
+    """Models, feature contract, history panel and context, loaded once."""
 
     def __init__(self, model_dir: Path):
         self.model = joblib.load(model_dir / "model.joblib")
+        eval_path = model_dir / "model_eval.joblib"
+        self.eval_model = joblib.load(eval_path) if eval_path.exists() else self.model
+        self.context = Context.load(model_dir)
         with open(model_dir / "feature_columns.json", encoding="utf-8") as fh:
             self.contract = json.load(fh)
         try:
@@ -67,6 +84,25 @@ class Artifacts:
             self.metrics = {}
         self.history = load_raw(str(model_dir / "history.csv.gz"))
         self.last_month = self.history[PERIOD].max()
+        self._backtest: pd.DataFrame | None = None
+
+    @property
+    def backtest(self) -> pd.DataFrame:
+        """
+        One-step-ahead prediction for every observed OD-month. Features are
+        causal, so a single pass over the full history gives each month the
+        exact number `/predict` returns when asked for it as a backtest.
+        """
+        if self._backtest is None:
+            engineered = build_features(
+                to_panel(self.history), self.context, BACKTEST_WEATHER
+            )
+            observed = engineered[
+                engineered[TARGET].notna() & engineered[ANCHOR].notna()
+            ].copy()
+            observed["predicted"] = predict_delays(self.eval_model, observed)
+            self._backtest = observed[[*OD_KEY, PERIOD, TARGET, "predicted"]]
+        return self._backtest
 
 
 @lru_cache(maxsize=1)
@@ -99,6 +135,15 @@ class PredictionRequest(BaseModel):
         description="Scheduled journey time in minutes. Defaults to the "
                     "OD's recent average.",
     )
+    weather: Literal["forecast", "normal", "harsh", "observed"] | None = Field(
+        default=None,
+        description="Weather scenario for the month at both ends of the route. "
+                    "`forecast`: days observed so far + 16-day forecast + normals "
+                    "for the rest; `normal`: seasonal normals; `harsh`: 90th "
+                    "percentile of the season; `observed`: what happened (past "
+                    "months only). Defaults to `forecast` for the coming month "
+                    "and `normal` for a backtest.",
+    )
 
 
 class PredictionResponse(BaseModel):
@@ -116,6 +161,34 @@ class PredictionResponse(BaseModel):
     )
     actual_delay_minutes: float | None = None
     history_up_to: str
+    weather: str = Field(description="Weather scenario used.")
+    model: Literal["final", "evaluation"] = Field(
+        description="`final`: refitted on every month (coming month); "
+                    "`evaluation`: fitted before the test period (backtests)."
+    )
+    context: dict[str, float | None] = Field(
+        description="Weather at the two ends of the route (mean) and calendar "
+                    "of the month, as fed to the model."
+    )
+
+
+class HistoryPoint(BaseModel):
+    month: str
+    actual_delay_minutes: float
+    predicted_delay_minutes: float | None = Field(
+        description="What the model forecast for that month with the data "
+                    "available the month before."
+    )
+
+
+class RouteHistory(BaseModel):
+    gare_depart: str
+    gare_arrivee: str
+    test_from: str | None = Field(
+        description="First month held out from training: predictions from "
+                    "there on are genuinely out of sample."
+    )
+    points: list[HistoryPoint]
 
 
 class RouteInfo(BaseModel):
@@ -126,14 +199,25 @@ class RouteInfo(BaseModel):
     recent_average_minutes: float
 
 
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
 @app.get("/health")
 def health() -> dict:
     art = artifacts()
+    weather, outlook = art.context.weather, art.context.outlook
     return {
         "status": "ok",
         "model": art.metrics.get("model", "unknown"),
         "history_up_to": str(art.last_month),
         "n_routes": int(art.history[OD].nunique()),
+        "weather_up_to": None if weather is None else str(weather[PERIOD].max()),
+        "outlook_months": [] if outlook is None or weather is None else sorted(
+            str(p) for p in outlook[PERIOD].unique() if p > weather[PERIOD].max()
+        ),
+        "school_calendar": art.context.school is not None,
     }
 
 
@@ -159,20 +243,38 @@ def routes() -> list[RouteInfo]:
     return out
 
 
+@app.get("/history", response_model=RouteHistory)
+def history(
+    gare_depart: str = Query(examples=["PARIS MONTPARNASSE"]),
+    gare_arrivee: str = Query(examples=["BORDEAUX ST JEAN"]),
+) -> RouteHistory:
+    """Observed monthly delays of a route, next to the model's forecasts."""
+    art = artifacts()
+    dep, arr = _normalise(gare_depart), _normalise(gare_arrivee)
+    route = _find_route(art.history, dep, arr)
+    predicted = art.backtest.set_index([*OD_KEY, PERIOD])["predicted"]
+    points = []
+    for period, actual in route.set_index(PERIOD)[TARGET].sort_index().items():
+        value = predicted.get((dep, arr, period))
+        points.append(HistoryPoint(
+            month=str(period),
+            actual_delay_minutes=round(float(actual), 2),
+            predicted_delay_minutes=None if value is None else round(float(value), 2),
+        ))
+    return RouteHistory(
+        gare_depart=dep,
+        gare_arrivee=arr,
+        test_from=art.metrics.get("test", {}).get("from"),
+        points=points,
+    )
+
+
 @app.post("/predict", response_model=PredictionResponse)
 def predict(req: PredictionRequest) -> PredictionResponse:
     art = artifacts()
     history = art.history
-    route = history[
-        (history["gare_depart"] == req.gare_depart.strip().upper())
-        & (history["gare_arrivee"] == req.gare_arrivee.strip().upper())
-    ]
-    if route.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=f"unknown route {req.gare_depart!r} -> {req.gare_arrivee!r}; "
-                   "see GET /routes for the available pairs",
-        )
+    dep, arr = _normalise(req.gare_depart), _normalise(req.gare_arrivee)
+    route = _find_route(history, dep, arr)
 
     target_period = _parse_month(req.month) if req.month else art.last_month + 1
     if target_period < route[PERIOD].min() + 1:
@@ -208,24 +310,57 @@ def predict(req: PredictionRequest) -> PredictionResponse:
             value = route[col].tail(6).mean()
         panel.loc[row_mask, col] = value
 
-    features = engineer_features(panel)
+    is_past = target_period <= art.last_month
+    weather = req.weather or (BACKTEST_WEATHER if is_past else "forecast")
+    if weather == "observed" and not art.context.has_observed_weather(
+        [dep, arr], target_period
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"no observed weather for {dep} / {arr} in {target_period}; "
+                   "use the 'forecast', 'normal' or 'harsh' scenario",
+        )
+
+    features = build_features(panel, art.context, weather)
     row = features[
         (features[OD] == route[OD].iloc[0]) & (features[PERIOD] == target_period)
     ]
-    prediction = float(predict_delays(art.model, row)[0])
+    model = art.eval_model if is_past else art.model
+    prediction = float(predict_delays(model, row)[0])
 
     actual = route.loc[route[PERIOD] == target_period, TARGET]
     recent = row["roll6"].iloc[0]
     return PredictionResponse(
-        gare_depart=req.gare_depart.strip().upper(),
-        gare_arrivee=req.gare_arrivee.strip().upper(),
+        gare_depart=dep,
+        gare_arrivee=arr,
         month=str(target_period),
         predicted_delay_minutes=round(prediction, 1),
         recent_average_minutes=None if pd.isna(recent) else round(float(recent), 1),
         is_backtest=not actual.empty,
         actual_delay_minutes=None if actual.empty else round(float(actual.iloc[0]), 1),
         history_up_to=str(art.last_month),
+        weather=weather,
+        model="evaluation" if is_past else "final",
+        context={
+            col: None if pd.isna(v) else round(float(v), 1)
+            for col, v in row[CONTEXT_COLUMNS].iloc[0].items()
+        },
     )
+
+
+def _normalise(station: str) -> str:
+    return " ".join(station.split()).upper()
+
+
+def _find_route(history: pd.DataFrame, dep: str, arr: str) -> pd.DataFrame:
+    route = history[(history["gare_depart"] == dep) & (history["gare_arrivee"] == arr)]
+    if route.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown route {dep!r} -> {arr!r}; "
+                   "see GET /routes for the available pairs",
+        )
+    return route
 
 
 def _parse_month(month: str) -> pd.Period:

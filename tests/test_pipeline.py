@@ -1,11 +1,8 @@
-import sys
-from pathlib import Path
+"""Unit tests of the ETL and feature engineering, on the synthetic export."""
 
 import numpy as np
 import pandas as pd
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import data_pipeline as dp
 from generate_data import generate, write

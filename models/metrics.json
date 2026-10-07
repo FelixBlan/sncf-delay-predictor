@@ -2,58 +2,80 @@
   "model": "rf",
   "target": "retard_moyen_tous_trains_arrivee",
   "test": {
-    "from": "2025-07",
-    "to": "2026-06",
+    "from": "2025-10",
+    "to": "2026-09",
     "n_rows": 1446,
-    "mae_minutes": 2.712,
-    "rmse_minutes": 3.702,
-    "r2": 0.406,
-    "bias_minutes": -1.518
+    "weather": "normal (climatology of the training years)",
+    "mae_minutes": 2.595,
+    "rmse_minutes": 3.617,
+    "r2": 0.48,
+    "bias_minutes": -1.043
+  },
+  "test_observed_weather": {
+    "mae_minutes": 2.494,
+    "rmse_minutes": 3.396,
+    "r2": 0.542,
+    "bias_minutes": -0.599
+  },
+  "test_without_context": {
+    "mae_minutes": 2.569,
+    "rmse_minutes": 3.572,
+    "r2": 0.493,
+    "bias_minutes": -0.753
   },
   "train": {
     "from": "2018-02",
-    "to": "2025-06",
-    "n_rows": 10760,
-    "fit_seconds": 25.1
+    "to": "2025-09",
+    "n_rows": 11122,
+    "fit_seconds": 3.86
+  },
+  "final_fit": {
+    "from": "2018-02",
+    "to": "2026-09",
+    "n_rows": 12568
   },
   "baselines": {
     "train_mean": {
-      "mae_minutes": 3.874,
-      "rmse_minutes": 5.49,
-      "r2": -0.306,
-      "bias_minutes": -2.657
+      "mae_minutes": 3.982,
+      "rmse_minutes": 5.776,
+      "r2": -0.326,
+      "bias_minutes": -2.864
     },
     "last_month": {
-      "mae_minutes": 3.165,
-      "rmse_minutes": 4.27,
-      "r2": 0.21,
-      "bias_minutes": -0.417
+      "mae_minutes": 3.464,
+      "rmse_minutes": 4.65,
+      "r2": 0.141,
+      "bias_minutes": 0.126
     },
     "mean_6_months": {
-      "mae_minutes": 2.8,
-      "rmse_minutes": 3.819,
-      "r2": 0.368,
-      "bias_minutes": -0.954
+      "mae_minutes": 2.904,
+      "rmse_minutes": 4.004,
+      "r2": 0.363,
+      "bias_minutes": -0.545
     },
     "mean_12_months": {
-      "mae_minutes": 2.798,
-      "rmse_minutes": 3.815,
-      "r2": 0.369,
-      "bias_minutes": -1.476
+      "mae_minutes": 2.822,
+      "rmse_minutes": 3.891,
+      "r2": 0.398,
+      "bias_minutes": -1.145
     }
   },
   "skill_vs_best_baseline": {
     "baseline": "mean_12_months",
-    "mae_reduction": 0.031
+    "mae_reduction": 0.08
   },
   "cv_mean_mae": {
-    "rf": 1.945,
-    "hgb": 1.997,
-    "baseline:mean_12_months": 2.061,
-    "baseline:mean_6_months": 2.083,
-    "baseline:train_mean": 2.594,
-    "baseline:last_month": 2.605
+    "rf": 2.141,
+    "hgb": 2.142,
+    "baseline:mean_12_months": 2.232,
+    "baseline:mean_6_months": 2.25,
+    "baseline:last_month": 2.724,
+    "baseline:train_mean": 2.892
   },
-  "n_features": 35,
-  "n_od_pairs": 130
+  "n_features": 54,
+  "n_od_pairs": 130,
+  "context": {
+    "weather_station_months": 6254,
+    "school_calendar": true
+  }
 }

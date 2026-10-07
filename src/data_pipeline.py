@@ -5,10 +5,12 @@ ETL + feature engineering for the SNCF open dataset
 Shape of the data
 -----------------
 One row = one origin-destination (OD) pair, aggregated over one calendar
-month: ~130 OD pairs x ~100 months. There is no per-train, per-hour or
-weather information, so the modelling problem is a *panel forecast*: given
-everything known up to month M-1 (plus the timetable for month M), predict
-the average arrival delay of month M.
+month: ~130 OD pairs x ~100 months. There is no per-train or per-hour
+information, so the modelling problem is a *panel forecast*: given
+everything known up to month M-1 (plus the timetable and the calendar of
+month M, and a weather scenario for it), predict the average arrival delay
+of month M. Weather and calendar come from outside the export, see
+`context.py`.
 
 Design notes
 ------------
@@ -27,6 +29,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+
+from context import CONTEXT_COLUMNS, Context, add_context
 
 RAW_SEP = ";"
 TARGET = "retard_moyen_tous_trains_arrivee"
@@ -64,18 +68,22 @@ PROFILE_COLS = RATE_COLS + [
     "retard_moyen_arrivee", "retard_moyen_tous_trains_depart",
     "prct_cause_infra", "prct_cause_externe",
     "prct_cause_gestion_trafic", "prct_cause_materiel_roulant",
+    "prct_cause_gestion_gare", "prct_cause_prise_en_charge_voyageurs",
 ]
 
 FEATURE_COLUMNS = [
     # --- the OD's own delay history
     "lag1", "lag2", "lag3", "lag12", "roll3", "roll6", "roll12",
     # --- network-wide state (captures shocks: strikes, storms, timetable changes)
-    "net_lag1", "net_roll3", "net_anomaly", "dep_lag1",
+    "net_lag1", "net_roll3", "net_anomaly", "net_lag12", "net_cancel_lag1",
+    "dep_lag1", "arr_lag1",
     # --- known in advance for the month being predicted
     "duree_moyenne", "nb_train_prevu", "traffic_ratio", "month",
     # --- recent reliability profile (last month + 6-month mean)
     *[f"{c}_lag1" for c in PROFILE_COLS],
     *[f"{c}_roll6" for c in PROFILE_COLS],
+    # --- weather scenario + calendar of the month being predicted (context.py)
+    *CONTEXT_COLUMNS,
 ]
 
 # The model predicts the *deviation* from this anchor rather than the delay
@@ -130,7 +138,7 @@ def _merge_services(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for key, group in df[duplicated].groupby(keys, sort=False):
         weights = group["nb_train_prevu"].clip(lower=0).fillna(0)
-        row = dict(zip(keys, key))
+        row = dict(zip(keys, key, strict=True))
         for col in COUNT_COLS:
             row[col] = group[col].sum(min_count=1)
         for col in MEAN_COLS:
@@ -244,13 +252,21 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["net_roll3"] = df[PERIOD].map(net.shift(1).rolling(3, min_periods=2).mean())
     net_roll12 = df[PERIOD].map(net.shift(1).rolling(12, min_periods=6).mean())
     df["net_anomaly"] = df["net_roll3"] - net_roll12
+    df["net_lag12"] = df[PERIOD].map(net.shift(12))
+    # network-wide cancellation rate last month: strikes show up here first
+    cancel = (
+        df.groupby(PERIOD, observed=True)[["nb_annulation", "nb_train_prevu"]].sum(min_count=1)
+        .reindex(months)
+    )
+    net_cancel = cancel["nb_annulation"] / cancel["nb_train_prevu"].replace(0, np.nan)
+    df["net_cancel_lag1"] = df[PERIOD].map(net_cancel.shift(1))
 
-    # departure-station state last month (a station's delays spill over its ODs)
-    station = df.groupby(["gare_depart", PERIOD], observed=True)[TARGET].mean()
-    station_lag1 = station.groupby(level="gare_depart").shift(1)
-    df["dep_lag1"] = pd.MultiIndex.from_arrays(
-        [df["gare_depart"], df[PERIOD]]
-    ).map(station_lag1)
+    # station state last month (a station's delays spill over all its ODs),
+    # on a gap-free index per station so that shift(1) is one month
+    for col, name in (("gare_depart", "dep_lag1"), ("gare_arrivee", "arr_lag1")):
+        station = df.groupby([col, PERIOD], observed=True)[TARGET].mean()
+        station = station.unstack(col).reindex(months).shift(1).stack(future_stack=True)
+        df[name] = pd.MultiIndex.from_arrays([df[PERIOD], df[col]]).map(station)
 
     # recent reliability profile
     for col in PROFILE_COLS:
@@ -284,7 +300,26 @@ def predict_delays(model, df: pd.DataFrame) -> np.ndarray:
     return np.clip(anchor.to_numpy() + model.predict(X), 0.0, None)
 
 
-def run_pipeline(raw_csv_path: str, min_trains: int = 10):
+def build_features(
+    panel: pd.DataFrame,
+    context: Context | None = None,
+    weather_mode: str = "observed",
+    climate_until: pd.Period | None = None,
+) -> pd.DataFrame:
+    """
+    Dense panel -> full feature set: the causal history features plus the
+    month's weather scenario and calendar. The one entry point used by
+    training, evaluation and the API.
+    """
+    return add_context(engineer_features(panel), context, weather_mode, climate_until)
+
+
+def run_pipeline(
+    raw_csv_path: str,
+    min_trains: int = 10,
+    context: Context | None = None,
+    weather_mode: str = "observed",
+):
     """
     raw CSV -> `(features, engineered_panel, clean_panel)`.
 
@@ -292,6 +327,6 @@ def run_pipeline(raw_csv_path: str, min_trains: int = 10):
     target and at least one month of history behind them.
     """
     clean_panel = clean(load_raw(raw_csv_path), min_trains=min_trains)
-    engineered = engineer_features(to_panel(clean_panel))
+    engineered = build_features(to_panel(clean_panel), context, weather_mode)
     features = engineered[engineered[TARGET].notna() & engineered[ANCHOR].notna()]
     return features.reset_index(drop=True), engineered, clean_panel

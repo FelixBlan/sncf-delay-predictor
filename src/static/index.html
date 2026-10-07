@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNCF Delay Predictor</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #14181f; --muted: #5d6675;
+    --line: #e2e5ea; --accent: #0b6bcb; --actual: #14181f; --pred: #d9480f;
+    --test: rgba(11, 107, 203, .07); --good: #2b8a3e; --bad: #c92a2a;
+    --on-accent: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --card: #171b21; --ink: #e8ebef; --muted: #98a1ae;
+      --line: #2a3038; --accent: #4dabf7; --actual: #e8ebef; --pred: #ff8a4c;
+      --test: rgba(77, 171, 247, .09); --good: #51cf66; --bad: #ff6b6b;
+      --on-accent: #0f1216;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 16px 48px; }
+  header h1 { margin: 0; font-size: 1.6rem; letter-spacing: -.01em; }
+  header p { margin: 6px 0 0; color: var(--muted); max-width: 680px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px; margin-top: 20px;
+  }
+  .controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, .8fr) auto; gap: 12px; align-items: end; }
+  .ctx { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-top: 12px; }
+  .ctx div { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .ctx b { display: block; font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+  .ctx span { font-size: .8rem; color: var(--muted); }
+  .ctx h3 { grid-column: 1 / -1; margin: 6px 0 0; font-size: .8rem; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  tr.aside td { color: var(--muted); font-style: italic; }
+  label { display: block; font-size: .8rem; color: var(--muted); margin-bottom: 4px; }
+  select, button {
+    width: 100%; font: inherit; padding: 9px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  button {
+    background: var(--accent); border-color: var(--accent); color: var(--on-accent);
+    font-weight: 600; cursor: pointer; padding: 9px 18px;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .kpi .label { font-size: .8rem; color: var(--muted); }
+  .kpi .value { font-size: 1.9rem; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .kpi .sub { font-size: .85rem; color: var(--muted); }
+  .chart-head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+  .chart-head h2 { margin: 0; font-size: 1.05rem; }
+  .legend { display: flex; gap: 16px; font-size: .85rem; color: var(--muted); flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 16px; height: 3px; vertical-align: middle; margin-right: 6px; border-radius: 2px; }
+  .legend i.box { height: 10px; background: var(--test); border: 1px solid var(--line); }
+  svg { width: 100%; height: auto; display: block; margin-top: 12px; }
+  svg text { fill: var(--muted); font-size: 11px; }
+  .grid line { stroke: var(--line); }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font-size: .85rem; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+    display: none; font-variant-numeric: tabular-nums;
+  }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-size: .8rem; color: var(--muted); font-weight: 500; }
+  tr.ours td { font-weight: 650; }
+  .note { color: var(--muted); font-size: .85rem; margin: 12px 0 0; }
+  .error { color: var(--bad); }
+  a { color: var(--accent); }
+  @media (max-width: 680px) {
+    .controls, .kpis { grid-template-columns: minmax(0, 1fr); }
+    .kpi .value { font-size: 1.6rem; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>SNCF Delay Predictor</h1>
+    <p>Forecasts next month's average arrival delay of a TGV route, trained on
+      SNCF's public monthly regularity data (AQST), the weather at both ends of
+      the line and the French holiday calendar. Pick a route to see its
+      history and what the model expects next.</p>
+  </header>
+
+  <section class="card">
+    <div class="controls">
+      <div>
+        <label for="dep">Departure</label>
+        <select id="dep" disabled><option>Loading…</option></select>
+      </div>
+      <div>
+        <label for="arr">Arrival</label>
+        <select id="arr" disabled></select>
+      </div>
+      <div>
+        <label for="wx">Weather scenario</label>
+        <select id="wx" disabled>
+          <option value="forecast">Forecast</option>
+          <option value="normal">Normal for the season</option>
+          <option value="harsh">Harsh (1 year in 10)</option>
+        </select>
+      </div>
+      <div><button id="go" disabled>Forecast</button></div>
+    </div>
+    <p id="status" class="note"></p>
+  </section>
+
+  <section class="card kpis" id="kpis" hidden>
+    <div class="kpi">
+      <div class="label">Forecast for <span id="k-month"></span></div>
+      <div class="value" id="k-pred"></div>
+      <div class="sub">average arrival delay, all trains</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Route's 6-month average</div>
+      <div class="value" id="k-recent"></div>
+      <div class="sub" id="k-diff"></div>
+    </div>
+    <div class="kpi">
+      <div class="label">Model error on this route</div>
+      <div class="value" id="k-mae"></div>
+      <div class="sub" id="k-mae-sub"></div>
+    </div>
+  </section>
+
+  <section class="card" id="ctx-card" hidden>
+    <h2 style="margin:0;font-size:1.05rem">Conditions fed to the model for <span id="ctx-month"></span></h2>
+    <p class="note" id="ctx-note" style="margin-top:4px"></p>
+    <div class="ctx" id="ctx"></div>
+  </section>
+
+  <section class="card" id="chart-card" hidden>
+    <div class="chart-head">
+      <h2 id="chart-title"></h2>
+      <div class="legend">
+        <span><i style="background:var(--actual)"></i>Observed</span>
+        <span><i style="background:var(--pred)"></i>Model, one month ahead</span>
+        <span><i class="box"></i>Held-out test period</span>
+      </div>
+    </div>
+    <svg id="chart" viewBox="0 0 940 320" role="img" aria-label="Monthly delay history"></svg>
+  </section>
+
+  <section class="card" id="perf" hidden>
+    <h2 style="margin:0 0 8px;font-size:1.05rem">How good is it? <span class="note" id="perf-range"></span></h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Forecaster</th><th>MAE (min)</th><th>RMSE (min)</th><th>R²</th></tr></thead>
+      <tbody id="perf-body"></tbody>
+    </table></div>
+    <p class="note">Scored on the last 12 months, which the model never saw during
+      training or model selection, with seasonal-normal weather: a genuine
+      forecast, made without knowing the month's weather. The italic rows are
+      for reference: the same model had it known the actual weather (an upper
+      bound for weather forecasts), and the same model without any weather or
+      calendar input. Baselines need no model at all: beating the route's own
+      recent average is the bar that matters.
+      Full API: <a href="/docs">/docs</a>.</p>
+  </section>
+</main>
+<div class="tip" id="tip"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (v) => v == null ? "–" : v.toFixed(1) + " min";
+let routes = [];
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || res.statusText);
+  return body;
+}
+
+function fillArrivals() {
+  const dep = $("dep").value;
+  const arrivals = routes.filter((r) => r.gare_depart === dep).map((r) => r.gare_arrivee);
+  $("arr").innerHTML = arrivals.map((a) => `<option>${a}</option>`).join("");
+}
+
+async function init() {
+  try {
+    const [rs, metrics] = await Promise.all([api("/routes"), api("/metrics")]);
+    routes = rs;
+    const deps = [...new Set(routes.map((r) => r.gare_depart))].sort();
+    $("dep").innerHTML = deps.map((d) => `<option>${d}</option>`).join("");
+    const start = routes.find((r) => r.gare_depart === "PARIS MONTPARNASSE"
+                                  && r.gare_arrivee === "BORDEAUX ST JEAN") || routes[0];
+    $("dep").value = start.gare_depart;
+    fillArrivals();
+    $("arr").value = start.gare_arrivee;
+    for (const id of ["dep", "arr", "wx", "go"]) $(id).disabled = false;
+    $("status").textContent = `${routes.length} routes · data up to ${maxMonth()}`;
+    renderPerf(metrics);
+    run();
+  } catch (e) {
+    $("status").innerHTML = `<span class="error">Could not reach the API: ${e.message}</span>`;
+  }
+}
+
+function maxMonth() {
+  return routes.reduce((m, r) => (r.last_month > m ? r.last_month : m), "");
+}
+
+function renderPerf(m) {
+  if (!m.test) return;
+  const label = { train_mean: "Overall average", last_month: "Same as last month",
+                  mean_6_months: "Route's 6-month average", mean_12_months: "Route's 12-month average" };
+  const rows = [[`Model (${m.model === "rf" ? "random forest" : "gradient boosting"})`, m.test, "ours"]];
+  if (m.test_observed_weather) rows.push(["Same model, actual weather known", m.test_observed_weather, "aside"]);
+  if (m.test_without_context) rows.push(["Same model, no weather or calendar", m.test_without_context, "aside"]);
+  rows.push(...Object.entries(m.baselines).map(([k, v]) => [label[k] || k, v, ""]));
+  $("perf-body").innerHTML = rows.map(([name, s, cls]) =>
+    `<tr class="${cls}"><td>${name}</td><td>${s.mae_minutes.toFixed(2)}</td>` +
+    `<td>${s.rmse_minutes.toFixed(2)}</td><td>${s.r2.toFixed(2)}</td></tr>`).join("");
+  $("perf-range").textContent = `(test: ${m.test.from} → ${m.test.to})`;
+  $("perf").hidden = false;
+}
+
+async function run() {
+  const body = { gare_depart: $("dep").value, gare_arrivee: $("arr").value };
+  $("go").disabled = true;
+  try {
+    const q = new URLSearchParams(body);
+    const [pred, hist] = await Promise.all([
+      api("/predict", { method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ ...body, weather: $("wx").value }) }),
+      api(`/history?${q}`),
+    ]);
+    renderKpis(pred, hist);
+    renderContext(pred);
+    renderChart(hist, pred);
+  } catch (e) {
+    $("status").innerHTML = `<span class="error">${e.message}</span>`;
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+function renderKpis(pred, hist) {
+  $("k-month").textContent = pred.month;
+  $("k-pred").textContent = fmt(pred.predicted_delay_minutes);
+  $("k-recent").textContent = fmt(pred.recent_average_minutes);
+  if (pred.recent_average_minutes != null) {
+    const d = pred.predicted_delay_minutes - pred.recent_average_minutes;
+    $("k-diff").textContent = `forecast is ${Math.abs(d).toFixed(1)} min ${d >= 0 ? "above" : "below"}`;
+  }
+  const test = hist.points.filter((p) => hist.test_from && p.month >= hist.test_from
+                                         && p.predicted_delay_minutes != null);
+  if (test.length) {
+    const mae = test.reduce((s, p) => s + Math.abs(p.predicted_delay_minutes - p.actual_delay_minutes), 0) / test.length;
+    $("k-mae").textContent = mae.toFixed(1) + " min";
+    $("k-mae-sub").textContent = `average miss over ${test.length} held-out months`;
+  } else {
+    $("k-mae").textContent = "–";
+    $("k-mae-sub").textContent = "no held-out months for this route";
+  }
+  $("kpis").hidden = false;
+}
+
+const SCENARIO_NOTE = {
+  forecast: "Weather: days already observed this month + the 16-day forecast, seasonal normals for the rest. Mean of the two ends of the route.",
+  normal: "Weather: seasonal normals at both ends of the route (2018 onwards).",
+  harsh: "Weather: a bad month for the season (90th percentile of each measure) at both ends of the route.",
+  observed: "Weather: as observed.",
+};
+
+function renderContext(pred) {
+  const c = pred.context || {};
+  const n = (v, unit = "") => v == null ? "–" : `${Math.round(v * 10) / 10}${unit}`;
+  const cell = (v, label) => `<div><b>${v}</b><span>${label}</span></div>`;
+  $("ctx-month").textContent = pred.month;
+  $("ctx-note").textContent = SCENARIO_NOTE[pred.weather] || "";
+  $("ctx").innerHTML =
+    `<h3>Weather</h3>` +
+    cell(n(c.wx_frost_days), "frost days") + cell(n(c.wx_hot_days), "days ≥ 32 °C") +
+    cell(n(c.wx_rain_mm, " mm"), "rain") + cell(n(c.wx_heavy_rain_days), "days ≥ 20 mm rain") +
+    cell(n(c.wx_snow_days), "snow days") + cell(n(c.wx_windy_days), "windy days") +
+    `<h3>Calendar</h3>` +
+    cell(n(c.cal_holidays), "public holidays (weekdays)") + cell(n(c.cal_long_weekends), "long weekends") +
+    cell(n(c.cal_bridges), "“ponts”") + cell(n(c.cal_school_any), "school-holiday days, any zone") +
+    cell(n(c.cal_school_all), "school-holiday days, all zones");
+  $("ctx-card").hidden = false;
+}
+
+function renderChart(hist, pred) {
+  const pts = hist.points.slice(-36);
+  const future = { month: pred.month, predicted_delay_minutes: pred.predicted_delay_minutes, future: true };
+  const all = [...pts, future];
+  const W = 940, H = 320, L = 44, R = 12, T = 12, B = 34;
+  const x = (i) => L + (i * (W - L - R)) / (all.length - 1);
+  const vals = all.flatMap((p) => [p.actual_delay_minutes, p.predicted_delay_minutes]).filter((v) => v != null);
+  const ymax = Math.max(5, Math.ceil(Math.max(...vals) / 5) * 5);
+  const y = (v) => T + (H - T - B) * (1 - v / ymax);
+
+  let svg = "";
+  const testIdx = all.findIndex((p) => hist.test_from && p.month >= hist.test_from);
+  if (testIdx >= 0) {
+    const x0 = testIdx === 0 ? L : (x(testIdx) + x(testIdx - 1)) / 2;
+    svg += `<rect x="${x0}" y="${T}" width="${W - R - x0}" height="${H - T - B}" fill="var(--test)"/>`;
+  }
+  svg += `<g class="grid">`;
+  for (let v = 0; v <= ymax; v += ymax / 5) {
+    svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>` +
+           `<text x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+  }
+  svg += `</g>`;
+  all.forEach((p, i) => {
+    const last = i === all.length - 1;
+    if ((p.month.endsWith("-01") && i < all.length - 4) || last) {
+      svg += `<text x="${x(i)}" y="${H - 12}" text-anchor="${last ? "end" : "middle"}">${p.month}</text>`;
+    }
+  });
+  const line = (key, color, dash) => {
+    let d = "", pen = false;
+    all.forEach((p, i) => {
+      const v = p[key];
+      if (v == null) { pen = false; return; }
+      d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`;
+      pen = true;
+    });
+    return `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" ${dash ? `stroke-dasharray="${dash}"` : ""} stroke-linejoin="round"/>`;
+  };
+  svg += line("actual_delay_minutes", "var(--actual)");
+  svg += line("predicted_delay_minutes", "var(--pred)", "5 4");
+  const fx = x(all.length - 1), fy = y(future.predicted_delay_minutes);
+  svg += `<circle cx="${fx}" cy="${fy}" r="5" fill="var(--pred)"/>`;
+  svg += `<text x="${L - 36}" y="${T + 2}" transform="rotate(-90 ${L - 36} ${T + 2})" text-anchor="end">minutes</text>`;
+  svg += `<line id="cursor" y1="${T}" y2="${H - B}" stroke="var(--muted)" stroke-width="1" visibility="hidden"/>`;
+  svg += `<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent" id="hit"/>`;
+  $("chart").innerHTML = svg;
+  $("chart-title").textContent = `${hist.gare_depart} → ${hist.gare_arrivee}`;
+  $("chart-card").hidden = false;
+
+  const hit = $("hit"), tip = $("tip"), cursor = $("cursor");
+  hit.onmousemove = (e) => {
+    const box = $("chart").getBoundingClientRect();
+    const sx = ((e.clientX - box.left) / box.width) * W;
+    const i = Math.max(0, Math.min(all.length - 1, Math.round(((sx - L) / (W - L - R)) * (all.length - 1))));
+    const p = all[i];
+    cursor.setAttribute("x1", x(i)); cursor.setAttribute("x2", x(i));
+    cursor.setAttribute("visibility", "visible");
+    tip.innerHTML = `<b>${p.month}</b>${p.future ? " (forecast)" : ""}<br>` +
+      (p.future ? "" : `Observed: ${fmt(p.actual_delay_minutes)}<br>`) +
+      `Model: ${fmt(p.predicted_delay_minutes)}`;
+    tip.style.display = "block";
+    tip.style.left = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 8) + "px";
+    tip.style.top = e.clientY + 14 + "px";
+  };
+  hit.onmouseleave = () => { tip.style.display = "none"; cursor.setAttribute("visibility", "hidden"); };
+}
+
+$("dep").addEventListener("change", () => { fillArrivals(); run(); });
+$("arr").addEventListener("change", run);
+$("wx").addEventListener("change", run);
+$("go").addEventListener("click", run);
+init();
+</script>
+</body>
+</html>
